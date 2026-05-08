@@ -1,6 +1,7 @@
 """
 powercenter_parser.py
 Parser for Informatica PowerCenter XML, based on real XML structure from paths.txt.
+Now copies attributes from reusable transformations to instances.
 """
 
 import json
@@ -77,7 +78,7 @@ class Repository:
 
 
 # ----------------------------------------------------------------------
-# Expression tokenizer (same as before, extendable)
+# Expression tokenizer (simplified, kept for compatibility)
 # ----------------------------------------------------------------------
 def tokenize(expr: str) -> List[str]:
     expr = re.sub(r'([(),+*/=<>!]+)', r' \1 ', expr)
@@ -214,22 +215,21 @@ class PowerCenterParser:
         name = map_elem.get("NAME", "")
         mapping = Mapping(name=name)
 
-        # Parse inline transformations (TRANSFORMATION elements)
+        # Parse inline transformations (SOURCE, EXPRESSION, LOOKUP, etc.)
         for trans_elem in map_elem.findall("TRANSFORMATION"):
             t = self._parse_transformation(trans_elem, origin="mapping_inline")
             mapping.transformations[t.name] = t
 
         # Parse INSTANCE elements (reusable source, target, transformations, mapplets)
+        # DO NOT overwrite an inline transformation that already has the same name.
         for inst_elem in map_elem.findall("INSTANCE"):
             inst_name = inst_elem.get("NAME", "")
+            if inst_name in mapping.transformations:
+                continue   # already parsed as inline transformation, keep it
             trans_name = inst_elem.get("TRANSFORMATION_NAME", inst_name)
             trans_type = inst_elem.get("TRANSFORMATION_TYPE", "")
-            # Create a placeholder Transformation for the instance.
-            # Its ports will be filled by reference to the actual definition later,
-            # but we can already note its presence.
             t = Transformation(name=inst_name, type=trans_type, reusable=True, origin="mapping_instance")
             t.attributes["TRANSFORMATION_NAME"] = trans_name
-            # If the instance is a source or target, we'll later resolve ports from folder sources/targets.
             mapping.transformations[inst_name] = t
 
         # Parse connectors (graph edges)
@@ -256,14 +256,16 @@ class PowerCenterParser:
         name = mpl_elem.get("NAME", "")
         mpl = Mapplet(name=name)
 
-        # Inline transformations inside mapplet
+        # Inline transformations
         for trans_elem in mpl_elem.findall("TRANSFORMATION"):
             t = self._parse_transformation(trans_elem, origin="mapplet_inline")
             mpl.transformations[t.name] = t
 
-        # Instances
+        # Instances - do not overwrite
         for inst_elem in mpl_elem.findall("INSTANCE"):
             inst_name = inst_elem.get("NAME", "")
+            if inst_name in mpl.transformations:
+                continue
             trans_name = inst_elem.get("TRANSFORMATION_NAME", inst_name)
             trans_type = inst_elem.get("TRANSFORMATION_TYPE", "")
             t = Transformation(name=inst_name, type=trans_type, reusable=True, origin="mapplet_instance")
@@ -292,26 +294,26 @@ class PowerCenterParser:
 
     # ------------------------------------------------------------------
     # Resolve connections – add source_transform/source_port to each port
+    # Also copy attributes from reusable definitions to instances.
     # ------------------------------------------------------------------
     def resolve_connections_in_mapping(self, mapping: Mapping, folder: Folder):
         """
         Using the mapping's connectors, annotate each port with its upstream source.
         This assumes that the target ports are already loaded (from instances definitions).
         For instances that are sources/targets/reusable, we need to look up the actual port definitions
-        from the folder's sources/targets/reusable_transformations.
+        from the folder's sources/targets/reusable_transformations, and also copy attributes.
         """
-        # First, for each instance, if it's a source or target, fetch its real ports from folder definitions
+        # First, for each instance, if it's a source or target, fetch its real ports and attributes from folder definitions
         for inst_name, inst_trans in mapping.transformations.items():
             if inst_trans.origin == "mapping_instance":
                 trans_name = inst_trans.attributes.get("TRANSFORMATION_NAME", "")
                 ttype = inst_trans.type
-                # Look up in folder
                 real_trans = None
                 if ttype == "Source Definition":
                     real_trans = folder.sources.get(trans_name)
                 elif ttype == "Target Definition":
                     real_trans = folder.targets.get(trans_name)
-                elif ttype in ("Expression", "Lookup", "Joiner", "Filter", "Router", "Aggregator", "Sequence", "Sorter", "Union", "Normalizer", "SQL Transformation", "Stored Procedure", "Custom Transformation", "Mapplet"):  # etc.
+                elif ttype in ("Expression", "Lookup", "Joiner", "Filter", "Router", "Aggregator", "Sequence", "Sorter", "Union", "Normalizer", "SQL Transformation", "Stored Procedure", "Custom Transformation", "Mapplet"):
                     real_trans = folder.reusable_transformations.get(trans_name)
                     if not real_trans:
                         # Maybe it's a mapplet instance? We'll treat it as a black box for now.
@@ -328,10 +330,12 @@ class PowerCenterParser:
                             scale=port.scale,
                             porttype=port.porttype,
                             default_value=port.default_value,
-                            expression=port.expression,  # expression will be overridden if the instance has a local expression
+                            expression=port.expression,
                             parent_transform_name=inst_name,
                         )
                         inst_trans.ports.append(new_port)
+                    # Copy attributes from the reusable definition to the instance
+                    inst_trans.attributes.update(real_trans.attributes)
 
         # Now apply connectors: for each connector, find the target port and set its source
         for conn in mapping.connectors:
@@ -346,7 +350,7 @@ class PowerCenterParser:
 
     # Similarly for mapplets
     def resolve_connections_in_mapplet(self, mapplet: Mapplet, folder: Folder):
-        # Similar logic as above
+        # First, for each instance, fetch real transformation and copy ports + attributes
         for inst_name, inst_trans in mapplet.transformations.items():
             if inst_trans.origin == "mapplet_instance":
                 trans_name = inst_trans.attributes.get("TRANSFORMATION_NAME", "")
@@ -372,7 +376,10 @@ class PowerCenterParser:
                             parent_transform_name=inst_name,
                         )
                         inst_trans.ports.append(new_port)
+                    # Copy attributes from reusable definition
+                    inst_trans.attributes.update(real_trans.attributes)
 
+        # Now resolve connectors
         for conn in mapplet.connectors:
             target_trans = mapplet.transformations.get(conn.to_instance)
             if not target_trans:
@@ -382,7 +389,6 @@ class PowerCenterParser:
                     port.source_transform = conn.from_instance
                     port.source_port = conn.from_field
                     break
-
 
     def to_json(self) -> str:
         """Serialize repository to JSON for inspection."""
