@@ -1,7 +1,7 @@
 """
 generate_pyspark.py
-Advanced code generator – handles multiple transformations including mapplets.
-With direct retrieval of lookup attributes from reusable definitions.
+Generates PySpark code from PowerCenter XML.
+Handles multiple databases, mapplets, and complex expressions.
 """
 
 import sys
@@ -10,7 +10,31 @@ from powercenter_parser import PowerCenterParser, Folder, Mapping, Transformatio
 from expression_compiler import translate_expression
 
 # ----------------------------------------------------------------------
-# Generic graph helpers
+# JDBC helper – with multi‑line SQL support
+# ----------------------------------------------------------------------
+def jdbc_read(table_or_query: str, conn_name: str, is_query: bool = False) -> str:
+    """
+    Generate a Spark JDBC read string.
+    Converts multi‑line SQL to a single line to avoid syntax errors.
+    """
+    if is_query:
+        # Collapse newlines and multiple spaces into a single space
+        query = ' '.join(table_or_query.split())
+        # Escape triple quotes inside the query
+        query = query.replace('"""', '\\"\\"\\"')
+        dbtable = f'"""({query}) as subq"""'
+    else:
+        dbtable = f'"{table_or_query}"'
+    return f"""spark.read.format("jdbc") \\
+    .option("url", CONNECTIONS["{conn_name}"]["url"]) \\
+    .option("user", CONNECTIONS["{conn_name}"]["user"]) \\
+    .option("password", CONNECTIONS["{conn_name}"]["password"]) \\
+    .option("driver", CONNECTIONS["{conn_name}"]["driver"]) \\
+    .option("dbtable", {dbtable}) \\
+    .load()"""
+
+# ----------------------------------------------------------------------
+# Graph helpers
 # ----------------------------------------------------------------------
 def build_upstream_map(transformations: dict, connectors: list) -> dict:
     upstream = {name: [] for name in transformations}
@@ -41,14 +65,16 @@ def topological_sort(transformations: dict, upstream: dict) -> list:
     return order
 
 # ----------------------------------------------------------------------
-# Transformation handlers (all accept a prefix parameter)
+# Transformation handlers
 # ----------------------------------------------------------------------
 def gen_source_qualifier(trans: Transformation, folder: Folder, upstream: list, prefix=""):
     sql = trans.attributes.get("Sql Query", "").strip()
     if sql:
-        return f'df_{prefix}{trans.name} = spark.sql("""\n{sql}\n""")\n'
+        sql = ' '.join(sql.split())       # collapse to single line
+        db_name = trans.database_name or "OLTP"
+        return f'df_{prefix}{trans.name} = {jdbc_read(sql, db_name, is_query=True)}\n'
     else:
-        return f'# No SQL override for Source Qualifier {trans.name}; reading source table\n'
+        return f'# No SQL override for Source Qualifier {trans.name}\n'
 
 def gen_expression(trans: Transformation, upstream: list, mapping, prefix=""):
     upstream_name = upstream[0] if upstream else "???"
@@ -82,14 +108,13 @@ def gen_filter(trans: Transformation, upstream: list, mapping, prefix=""):
     return f'df_{prefix}{trans.name} = df_{prefix}{upstream_name}.filter({col_cond})\n'
 
 def gen_lookup(trans: Transformation, upstream: list, folder: Folder, mapping, prefix=""):
-    # If this is an instance of a reusable lookup, get the real definition
+    # Get reusable definition if needed
     real_trans = None
     if trans.origin in ("mapping_instance", "mapplet_instance"):
         real_name = trans.attributes.get("TRANSFORMATION_NAME", "")
         if real_name:
             real_trans = folder.reusable_transformations.get(real_name)
 
-    # Helper to get attribute from instance or real definition
     def get_attr(name, default=""):
         val = trans.attributes.get(name)
         if val is not None and val != "":
@@ -98,15 +123,20 @@ def gen_lookup(trans: Transformation, upstream: list, folder: Folder, mapping, p
             return real_trans.attributes.get(name, default)
         return default
 
-    # Determine lookup source DataFrame
     sql_override = get_attr("Lookup Sql Override", "").strip()
+    conn_info = trans.connection_info or get_attr("Connection Information", "")
+    if conn_info.startswith("$"):
+        conn_name = conn_info
+    else:
+        conn_name = conn_info if conn_info else "OLAP"
+
     if sql_override:
-        lookup_df = f'spark.sql("""\n{sql_override}\n""")'
+        sql_override = ' '.join(sql_override.split())   # collapse
+        lookup_df = jdbc_read(sql_override, conn_name, is_query=True)
     else:
         table_name = get_attr("Lookup table name", trans.name)
-        lookup_df = f'spark.table("{table_name}")'
+        lookup_df = jdbc_read(table_name, conn_name, is_query=False)
 
-    # Get the lookup condition
     condition = get_attr("Lookup condition", "").strip()
     if not condition:
         print(f"WARNING: Lookup {trans.name} has no join condition. Using cross join.")
@@ -115,13 +145,11 @@ def gen_lookup(trans: Transformation, upstream: list, folder: Folder, mapping, p
         try:
             condition = translate_expression(condition, mapping.variables if mapping else {})
         except Exception as e:
-            print(f"WARNING: Failed to translate lookup condition for {trans.name}: {e}. Using cross join.")
+            print(f"WARNING: Failed to translate lookup condition for {trans.name}: {e}")
             condition = "F.lit(1) == F.lit(1)"
 
-    # Determine upstream DataFrame name (fallback if upstream list is empty)
     upstream_name = upstream[0] if upstream else None
     if upstream_name is None:
-        # Inside mapplet, fallback to the Input Transformation
         upstream_placeholder = f"df_{prefix}INPUT" if prefix else "???"
         print(f"WARNING: Lookup {trans.name} has no upstream defined. Using {upstream_placeholder}")
         upstream_name = upstream_placeholder
@@ -193,6 +221,7 @@ def gen_sequence(trans: Transformation, upstream: list, prefix=""):
 def gen_target(trans: Transformation, upstream: list, prefix=""):
     upstream_name = upstream[0] if upstream else "???"
     target_table = trans.attributes.get("TRANSFORMATION_NAME", trans.name)
+    db_name = trans.database_name or "OLAP"
     cols = []
     for port in trans.ports:
         if port.source_transform and port.source_port:
@@ -203,11 +232,17 @@ def gen_target(trans: Transformation, upstream: list, prefix=""):
     return f"""df_target_{trans.name} = df_{prefix}{upstream_name}.select(
     {cols_str}
 )
-df_target_{trans.name}.write.format("delta").mode("overwrite").saveAsTable("{target_table}")
+df_target_{trans.name}.write.format("jdbc") \\
+    .option("url", CONNECTIONS["{db_name}"]["url"]) \\
+    .option("user", CONNECTIONS["{db_name}"]["user"]) \\
+    .option("password", CONNECTIONS["{db_name}"]["password"]) \\
+    .option("driver", CONNECTIONS["{db_name}"]["driver"]) \\
+    .option("dbtable", "{target_table}") \\
+    .mode("overwrite") \\
+    .save()
 """
 
 def generate_trans_code(trans, ttype, upstream_list, folder, mapping, prefix=""):
-    """Route to the correct handler with prefix."""
     if ttype == "Source Qualifier":
         return gen_source_qualifier(trans, folder, upstream_list, prefix)
     elif ttype == "Expression":
@@ -230,14 +265,9 @@ def generate_trans_code(trans, ttype, upstream_list, folder, mapping, prefix="")
         return f"# Transformation {trans.name} of type {ttype} - not yet implemented\n"
 
 # ----------------------------------------------------------------------
-# Mapplet expansion
+# Mapplet expansion (identical to previous version, uses same handlers)
 # ----------------------------------------------------------------------
 def generate_mapplet_code(instance_name: str, mapplet_def, folder, upstream_df_name: str, mapping_variables: dict, parser) -> (str, str):
-    """
-    Generate inline PySpark code for a mapplet instance.
-    Returns (code_string, output_df_name).
-    """
-    # Resolve connections inside mapplet (load real ports for reusable transformations)
     parser.resolve_connections_in_mapplet(mapplet_def, folder)
 
     upstream = build_upstream_map(mapplet_def.transformations, mapplet_def.connectors)
@@ -246,7 +276,6 @@ def generate_mapplet_code(instance_name: str, mapplet_def, folder, upstream_df_n
     prefix = f"mplt_{instance_name}_"
     lines = []
 
-    # Find Input and Output transformations
     input_trans_name = None
     output_trans_name = None
     for tname, trans in mapplet_def.transformations.items():
@@ -260,43 +289,34 @@ def generate_mapplet_code(instance_name: str, mapplet_def, folder, upstream_df_n
     if output_trans_name is None:
         raise ValueError(f"Mapplet {mapplet_def.name} has no Output Transformation")
 
-    # Create a dummy mapping-like object for variables used inside the mapplet
     class DummyMapping:
         def __init__(self, variables):
             self.variables = variables
     dummy_mapping = DummyMapping(mapplet_def.variables)
 
-    # First, assign upstream DataFrame to the Input Transformation's variable
     lines.append(f"df_{prefix}{input_trans_name} = {upstream_df_name}")
-    generated = {input_trans_name}
 
-    # Generate transformations in topological order, skipping Input and Output
     for tname in order:
         if tname in (input_trans_name, output_trans_name):
             continue
         trans = mapplet_def.transformations[tname]
         ups = upstream[tname]
-        # If upstream list is empty, try to use the Input Transformation as fallback
         if not ups:
             ups = [input_trans_name]
             print(f"Warning: Transformation {tname} has no upstream; using {input_trans_name} as fallback.")
         ttype = trans.type
         code = generate_trans_code(trans, ttype, ups, folder, dummy_mapping, prefix=prefix)
         lines.append(code)
-        generated.add(tname)
 
-    # Determine output DataFrame: usually the upstream of Output Transformation
     out_ups = upstream.get(output_trans_name, [])
     if out_ups:
         output_df_name = f"df_{prefix}{out_ups[0]}"
     else:
-        # Fallback: last generated transformation
         output_df_name = f"df_{prefix}{order[-1]}" if order else None
 
     if output_df_name is None:
         raise ValueError(f"Cannot determine output DataFrame for mapplet {instance_name}")
 
-    # Optionally apply a select based on Output Transformation ports
     output_trans = mapplet_def.transformations[output_trans_name]
     if output_trans.ports:
         selections = []
@@ -323,7 +343,6 @@ def generate_script(parser: PowerCenterParser, folder_name: str, mapping_name: s
     if not mapping:
         raise ValueError(f"Mapping {mapping_name} not found")
 
-    # Resolve connections in mapping (load ports from folder definitions)
     parser.resolve_connections_in_mapping(mapping, folder)
 
     upstream = build_upstream_map(mapping.transformations, mapping.connectors)
@@ -332,6 +351,11 @@ def generate_script(parser: PowerCenterParser, folder_name: str, mapping_name: s
     with open(output_path, 'w') as f:
         f.write(f"# Auto-generated PySpark script for mapping: {mapping_name}\n\n")
         f.write("from pyspark.sql import SparkSession\nfrom pyspark.sql import functions as F\n\n")
+        f.write("# Import connection dictionary\n")
+        f.write("try:\n")
+        f.write("    from db_config import CONNECTIONS\n")
+        f.write("except ImportError:\n")
+        f.write("    raise ImportError(\"Please create db_config.py with a CONNECTIONS dictionary.\")\n\n")
         f.write("try:\n    spark\nexcept NameError:\n    spark = SparkSession.builder.appName('{0}').getOrCreate()\n\n".format(mapping_name))
 
         for name in order:
@@ -339,14 +363,11 @@ def generate_script(parser: PowerCenterParser, folder_name: str, mapping_name: s
             ups = upstream[name]
             ttype = trans.type
 
-            # Skip source definitions (they are just tables)
             if ttype == "Source Definition":
                 continue
-            # Skip disconnected targets
             if ttype == "Target Definition" and not ups:
                 continue
 
-            # Handle Mapplet instance specially
             if ttype == "Mapplet":
                 mapplet_name = trans.attributes.get("TRANSFORMATION_NAME", "")
                 if not mapplet_name:
@@ -356,14 +377,8 @@ def generate_script(parser: PowerCenterParser, folder_name: str, mapping_name: s
                     if not mapplet_def:
                         code = f"# Mapplet definition {mapplet_name} not found\n"
                     else:
-                        # Determine upstream DataFrame name
                         upstream_name = ups[0] if ups else None
-                        if upstream_name:
-                            upstream_df = f"df_{upstream_name}"
-                        else:
-                            upstream_df = "spark.range(1)"
-                            print(f"Warning: Mapplet {name} has no upstream. Using dummy DataFrame.")
-                        # Generate mapplet code
+                        upstream_df = f"df_{upstream_name}" if upstream_name else "spark.range(1)"
                         mpl_code, mpl_output = generate_mapplet_code(
                             name, mapplet_def, folder, upstream_df, mapping.variables, parser
                         )
@@ -371,7 +386,6 @@ def generate_script(parser: PowerCenterParser, folder_name: str, mapping_name: s
                 f.write(code)
                 continue
 
-            # Regular transformation
             code = generate_trans_code(trans, ttype, ups, folder, mapping, prefix="")
             f.write(code)
 
@@ -383,24 +397,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     xml_file = sys.argv[1]
-
     parser = PowerCenterParser()
     repo = parser.parse(xml_file)
 
     if not repo.folders:
         raise ValueError("No folders found in repository")
-    # Take the first folder
     folder_name = list(repo.folders.keys())[0]
     folder = repo.folders[folder_name]
-
     if not folder.mappings:
         raise ValueError(f"No mappings found in folder '{folder_name}'")
-    # Take the first mapping
     mapping_name = list(folder.mappings.keys())[0]
 
-    # Generate output filename from mapping name (replace problematic characters)
     output_script = f"{mapping_name}.py"
-    # Replace spaces or other special characters (simple cleanup)
     output_script = output_script.replace(' ', '_').replace('/', '_').replace('\\', '_')
 
     print(f"Processing: folder='{folder_name}', mapping='{mapping_name}'")

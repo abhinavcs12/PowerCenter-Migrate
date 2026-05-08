@@ -1,5 +1,4 @@
 # db_config.py
-
 CONNECTIONS = {
     "OLTP": {
         "url": "jdbc:oracle:thin:@//oltp_host:1521/oltp_service",
@@ -8,6 +7,12 @@ CONNECTIONS = {
         "driver": "oracle.jdbc.OracleDriver"
     },
     "OLAP": {
+        "url": "jdbc:oracle:thin:@//olap_host:1521/olap_service",
+        "user": "olap_user",
+        "password": "olap_password",
+        "driver": "oracle.jdbc.OracleDriver"
+    },
+    "$Target": {
         "url": "jdbc:oracle:thin:@//olap_host:1521/olap_service",
         "user": "olap_user",
         "password": "olap_password",
